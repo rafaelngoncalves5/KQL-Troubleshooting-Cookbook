@@ -1,0 +1,348 @@
+// KQL Troubleshooting Cookbook
+// Generated from OneNote selected notes.
+// Notes:
+// - Replace sample IDs, timestamps, rollout names, node names, and artifact IDs before running.
+// - Some sections include SQL/T-SQL snippets in comments because they are useful alongside KQL.
+// - Queries were cleaned for GitHub readability and normalized where OneNote introduced spacing artifacts.
+
+// ============================================================================
+// Core telemetry tables reference
+// ============================================================================
+
+// ASTrace
+// Execution trace telemetry from Analysis Services (AS) engine.
+// Useful for checking if something executed, where it slowed down, whether it failed,
+// timed out, or throttled, and correlating errors using RootActivityId / TraceActivityId.
+
+// Evt5653745998362568492All
+// Cross-cluster view of engine snapshots. Useful for dataset/model size, model growth,
+// metadata state, last known model state, and capacity/model history analysis.
+
+// ASEngineReportModelTraits
+// Classifies models/datasets. Useful for understanding model type, storage mode,
+// datasource types, premium files, and large model traits.
+
+// MonVdwQueryOperation
+// Query execution telemetry. Useful for query analysis.
+
+// CapacityCpuPerWorkloadOperation
+// CU consumption broken down by workload, artifact, and execution. Useful for capacity
+// saturation/throttling investigations, top CU consumers, interactive delays/rejections,
+// Fabric Capacity Metrics App validation, and CPU attribution.
+
+// ============================================================================
+// Capacity: obtain capacity load graph
+// ============================================================================
+
+let StartTime = datetime(2024-04-08 00:00:00);
+let FinishTime = datetime(2024-04-17 00:00:00);
+let CapacityId = "B7347A3E-D59F-4D90-B637-A18B2E0DDC5A";
+CapacityCpuPerWorkloadSummary
+| where TIMESTAMP >= StartTime and TIMESTAMP < FinishTime
+| where PremiumCapacityId == CapacityId
+| extend UpdatedBaseCoreCount = case(
+    PremiumCapacitySku in ("A1", "EM1"), 0.5,
+    PremiumCapacitySku in ("A2", "EM2"), 1.0,
+    BaseCoreCount * 1.0
+)
+| extend UpdatedAutoScaleCoreCount = iff(AutoScaleCoreCount < 1.0, 0.0, AutoScaleCoreCount / 2.0)
+| extend TotalCoreCount = UpdatedAutoScaleCoreCount + UpdatedBaseCoreCount
+| extend MaxCpuMs = TotalCoreCount * 30.0 * 1000.0
+| extend PercentageUsage = CpuTimeMs * 100.0 / MaxCpuMs
+| project TIMESTAMP, PercentageUsage
+| render timechart;
+
+// ============================================================================
+// Capacity: obtain capacity load per artifact / operation
+// ============================================================================
+
+let StartTime = datetime(2024-03-01 01:00:00) - 1m;
+let FinishTime = datetime(2024-03-26 01:15:00) + 1m;
+let CapacityId = "8836ED54-EAC6-4A79-B410-FAE5FD7398A1";
+CapacityCpuPerWorkloadOperation
+| where TIMESTAMP >= StartTime and TIMESTAMP <= FinishTime
+| where PremiumCapacityId == CapacityId;
+
+// ============================================================================
+// Error investigation: analyze error with activity ID
+// ============================================================================
+
+let RootActivityIdParam = "e118edc1-76c7-4e38-b979-2e947dcce71b";
+Trace
+| where RootActivityId == RootActivityIdParam
+| project TIMESTAMP, EventText, Level, InstanceId, ActivityType, TraceActivityId, RootActivityId, ClientActivityId
+| where Level <= 3;
+
+// ============================================================================
+// Error investigation: analyze error with activity and request ID
+// ============================================================================
+
+let RequestIdParam = "f660d25a-f3c2-4f12-96fa-7314789a7288";
+let RootActivityIdParam = "e118edc1-76c7-4e38-b979-2e947dcce71b";
+Trace
+| where * has RequestIdParam and RootActivityId == RootActivityIdParam
+| project TIMESTAMP, EventText, Level, InstanceId, ActivityType, TraceActivityId, RootActivityId, ClientActivityId
+| where Level <= 3;
+
+// ============================================================================
+// Dataset: refresh history
+// ============================================================================
+
+let pbiDataset = "2a78dc44-f220-47df-b559-f612a9e58483";
+let StartTime = datetime(2024-03-01 00:00:00);
+let EndTime = datetime(2024-03-26 00:00:00);
+cluster("wabinam.kusto.windows.net").database("BIAzureKustoProd").FormattedTrace
+| where TIMESTAMP between (StartTime .. EndTime)
+| where ActivityType in ("WRLA", "WMRM")
+| where EventText hasprefix "Event: FireActivityCompleted" and EventText has pbiDataset
+| extend AI = parse_json(extract("ai=([^)]+)", 1, EventText))
+| parse EventText with * "duration=" Duration:long "," *
+| extend DurationInMin = Duration / 60000
+| project TIMESTAMP, Tenant, RootActivityId, ActivityType, DurationInMin, AI, EventText
+| extend PackageId = tostring(AI.PackageId)
+| extend ModelId = tostring(AI.ModelId)
+| extend RefreshType = tostring(AI.RefreshType)
+| extend UserId = tostring(AI.UserId)
+| extend TenantId = tostring(AI.TenantId)
+| extend CapacityId = tostring(AI.CapacityId)
+| extend PUID = tostring(AI.PUID)
+| extend CapacityObjectId = tostring(AI.CapacityObjectId)
+| extend ModelSize = tostring(AI.ModelSize)
+| extend IncrementalRefreshEnabled = tostring(AI.IncrementalRefreshEnabled)
+| extend DatabaseName = tostring(AI.DatabaseName)
+| extend GatewayRequired = tostring(AI.GatewayRequired)
+| project TIMESTAMP, Tenant, RootActivityId, ActivityType, DatabaseName, DurationInMin, PackageId, ModelId, ModelSize, RefreshType, UserId, TenantId, CapacityId, CapacityObjectId, PUID, IncrementalRefreshEnabled, AI, EventText;
+
+// ============================================================================
+// Pipeline check: failed activity runs
+// ============================================================================
+
+let PipelineId = "2c843c42-764f-42d1-8ab1-32b92cc14310";
+cluster("adfcus.kusto.windows.net").database("AzureDataFactory").ActivityRuns
+| union cluster("adfneu.kusto.windows.net").database("AzureDataFactory").ActivityRuns
+| where pipelineName has PipelineId
+| where status has "Failed";
+
+// ============================================================================
+// Node CPU check
+// ============================================================================
+
+ASPerformanceCounters
+| where TIMESTAMP >= ago(30d)
+| where Node in ("_b-hsc-4B_2", "_b-hsc-4A_0")
+| where PerformanceObject == "Processor"
+| where CounterName == "% Processor Time"
+| project TIMESTAMP, Value, Node
+| render timechart;
+
+// ============================================================================
+// Power BI session check
+// ============================================================================
+
+let SessionId = "8ca2f7a9-c83c-436d-898d-43b8b97b0277";
+customEvents
+| where session_Id == SessionId
+| where timestamp >= ago(180d)
+| project timestamp, name, customDimensions
+| order by timestamp asc;
+
+// ============================================================================
+// Generic broad RAID / ASTrace lookup
+// Cluster: pbipeastus.eastus.kusto.windows.net, database: pbip
+// ============================================================================
+
+let id = "e58b35f6-79aa-45be-a8cc-462165265631";
+ASTrace
+| where TIMESTAMP >= ago(7d)
+| where Severity <= 2
+| where * has id;
+
+// ============================================================================
+// End-to-end trace
+// ============================================================================
+
+PbiToMwcEndToEndProdTraces("55ec5098-08de-4187-ba0a-1b5d3d8c57e8")
+| where Level_Or_Severity == "Error"
+| where EventText_Or_MessageText contains "InternalError"
+| project TIMESTAMP, Tenant_Or_RolloutFQDN, Role_Or_ClusterName, RoleInstance_Or_Node, RootActivityId, EventText_Or_MessageText;
+
+// ============================================================================
+// Capacity: burndown
+// Cluster: pbipeastus.eastus.kusto.windows.net, database: pbip
+// ============================================================================
+
+let start = ago(3h);
+let end = now();
+let capacityID = "0A5E7634-18E7-4AE8-A1CC-E0A877DC2989";
+CapacityCpuPerWorkloadSummary
+| where TIMESTAMP between (start .. end)
+| where PremiumCapacityId has capacityID
+| extend MaxCUinMs = (BaseCapacityUnits + max_of(AutoScaleCoreCount * 8, 0)) * 30 * 1000
+| extend
+    CPUTimeUtilized_perc = (CpuTimeCapacityUnitMs / MaxCUinMs) * 100,
+    TotalOverage_Acumulated_Perc = (CumulativeCarryForward / MaxCUinMs) * 100,
+    Overage_Add_Perc = (CarryForwardAdd / MaxCUinMs) * 100,
+    Overage_Burndown_Perc = (CarryForwardBurnDown / MaxCUinMs) * 100
+| project TIMESTAMP, CpuTimeCapacityUnitMs, MaxCUinMs, CPUTimeUtilized_perc, Overage_Add_Perc, Overage_Burndown_Perc, TotalOverage_Acumulated_Perc, MaxLimitPerc = 100
+| order by TIMESTAMP desc;
+// | render timechart
+
+// ============================================================================
+// Capacity: throttling
+// Cluster: pbipeastus.eastus.kusto.windows.net, database: pbip
+// ============================================================================
+
+let start = ago(5d);
+let end = now();
+let VS = "0A5E7634-18E7-4AE8-A1CC-E0A877DC2989"; // capacity ID
+let rollout = "eastus2.pbidedicated.windows.net"; // change based on capacity ID
+CapacityCpuPerWorkloadSummary
+| where todatetime(WindowStartTime) >= start and todatetime(WindowEndTime) <= end
+| where RolloutFQDN has rollout
+| where PremiumCapacityId has VS
+| extend throttling_limit = BaseCoreCount * 30000 + max_of(AutoScaleCoreCount, AutoScaleCoreLimit) * 15000
+| project WindowStartTime = todatetime(WindowStartTime), CpuTimeMs, throttling_limit
+| render timechart;
+
+// ============================================================================
+// OneLake operations: non-success HTTP status codes
+// ============================================================================
+
+let StartTime = datetime(2026-03-22 03:45:00);
+let EndTime = datetime(2026-03-22 04:00:00);
+OneLakeClientActivity
+| where TIMESTAMP between (StartTime .. EndTime)
+| where httpUrl has "2FDCD215-915E-43CA-BB66-45F8A96ABFB4"
+| where httpStatusCode !in (200, 201, 202, 204, 206)
+| project TIMESTAMP, env_time, env_dt_traceId, env_dt_spanId, parentId,
+          workspaceId, artifactId, httpUrl, name, httpStatusCode, httpMethod,
+          env_properties, instanceId
+| order by TIMESTAMP asc;
+
+// ============================================================================
+// Capacity: simplest capacity usage percentage
+// ============================================================================
+
+CapacityCpuPerWorkloadSummary
+| where TIMESTAMP > ago(1h)
+| extend CapacityLimitMs = BaseCoreCount * 30000 + max_of(AutoScaleCoreCount, AutoScaleCoreLimit) * 15000
+| extend CapacityUsedPct = 100.0 * CpuTimeMs / CapacityLimitMs
+| project TIMESTAMP, CapacityUsedPct;
+
+// ============================================================================
+// Deployment activity logs based on operation ID
+// ============================================================================
+
+AlmDeploymentActivityLogs("d216ce3c-88a4-47a2-838e-e8ebf3944e11", ago(30d))
+| where Level <= 2;
+
+// ============================================================================
+// Dataset size over time
+// ============================================================================
+
+let DatasetId = "8cecfef2-22d0-4b52-b998-891366fa85af";
+Evt5653745998362568492All
+| extend OriginalTimestamp = todatetime(TIMESTAMP)
+| where TIMESTAMP > ago(30d)
+| where EventMessage contains DatasetId
+| where viewName endswith ".PR_PowerBIModelsView"
+| parse-where EventMessage with * "SizeInMBs\":\"" sizeMb:long *
+| project OriginalTimestamp, sizeMb;
+
+// ============================================================================
+// Topology violation
+// ============================================================================
+
+let LogicalServerNameParam = "e8a1f6b9-ce5b-4322-81cb-71c0bc8e126b";
+MonVdwWorkloadManager
+| where LogicalServerName == LogicalServerNameParam
+| where event == "wg_load" and wg_name == "SELECT"
+| where originalEventTimestamp > ago(7d)
+| summarize max_demand = max(demand_topology_size), avg_demand = avg(demand_topology_size) by bin(originalEventTimestamp, 1h), max_topology_size
+| order by originalEventTimestamp desc;
+
+// ============================================================================
+// DQP: identify queries completed in a given timeframe
+// ============================================================================
+
+let _margin = int(60);
+let logicalServerName = "e8a1f6b9-ce5b-4322-81cb-71c0bc8e126b";
+let queryEndTime = datetime(2026-07-09T18:17:35.1994114Z);
+let queryStartTime = datetime(2026-07-09T18:05:38.6087280Z);
+let _timeMargin = make_timespan(_margin / 86400, (_margin % 86400) / 3600, (_margin % 3600) / 60, _margin % 60);
+let startTime = queryStartTime - _timeMargin;
+let endTime = queryEndTime + _timeMargin;
+let _kustoHost = current_cluster_endpoint();
+let kustoCluster = tostring(split(_kustoHost, ".")[0]);
+MonVdwQueryOperation
+| where LogicalServerName has logicalServerName
+| where originalEventTimestamp between (startTime .. endTime)
+| where event == "task_group_exec"
+| where status != "Started"
+| project distributed_statement_id,
+          taskId = distributed_query_operator_id,
+          event,
+          status,
+          originalEventTimestamp,
+          duration_ms,
+          exec_time_ms,
+          distributed_execution_id,
+          distributed_submission_id,
+          AppTypeName,
+          distributed_task_group_id,
+          NodeName,
+          AppName,
+          dopp_input,
+          dopp_output,
+          actual_cpu_mbs,
+          actual_memory_mbs,
+          actual_input_disk_mbs,
+          actual_output_disk_mbs,
+          granted_cpu_mbs,
+          granted_disk_mbs,
+          granted_memory_mbs,
+          distributed_request_id
+| order by originalEventTimestamp asc;
+
+// ============================================================================
+// SQL: identify query text by distributed statement ID
+// ============================================================================
+
+// SELECT distributed_statement_id, command
+// FROM queryinsights.exec_requests_history
+// WHERE distributed_statement_id = 'FC8F0085-8DB0-4A9F-818C-5BB3A93F6FDE';
+
+// ============================================================================
+// SQL: identify table statistics
+// ============================================================================
+
+// DBCC SHOW_STATISTICS
+// (
+//     '[pricing].[FACT_AccessorialChargeRatePortPairGeoHierarchy]',
+//     '_WA_Sys_00_ID_AccessorialChargeRate'
+// )
+// WITH DENSITY_VECTOR;
+// GO
+//
+// DBCC SHOW_STATISTICS
+// (
+//     '[technical].[TMP_ACR_PortPairGeoHierarchy]',
+//     '_WA_Sys_00_ID_AccessorialChargeRate'
+// )
+// WITH DENSITY_VECTOR;
+// GO
+
+// ============================================================================
+// God-mode trace search
+// ============================================================================
+
+let AllWabiTrace = union
+    cluster("https://wabinam.kusto.windows.net").database("BIAzureKustoProd").FormattedTrace,
+    cluster("https://wabicentralus.centralus.kusto.windows.net").database("BIAzureKustoProd").FormattedTrace,
+    cluster("https://wabieastus.eastus.kusto.windows.net").database("BIAzureKustoProd").FormattedTrace,
+    cluster("https://biazure.kusto.windows.net").database("BIAzureKustoProd").FormattedTrace;
+AllWabiTrace
+| where TIMESTAMP between (datetime(2026-07-27 13:17) .. datetime(2026-07-27 17:30))
+| where * has "ada7a4fa-5bb2-45a7-85c6-fb6bd1e3bc64"
+   or * has "a7d6d8a9-c4f5-445b-9216-87987edaba84"
+| where Level <= 3;
